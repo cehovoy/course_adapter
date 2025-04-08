@@ -22,8 +22,8 @@
 
 1. Клонируйте репозиторий:
 ```bash
-git clone https://github.com/username/adapter_course.git
-cd adapter_course
+git clone https://github.com/cehovoy/course_adapter.git
+cd course_adapter
 ```
 
 2. Создайте виртуальное окружение и установите зависимости:
