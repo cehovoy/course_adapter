@@ -105,7 +105,7 @@ def backup_database(output_dir=None):
         return False
 
 def restore_database(backup_file):
-    """Восстанавливает базу данных из резервной копии"""
+    """Восстанавливает базу данных из резервной копии, используя маппинг ID для связей."""
     if not os.path.exists(backup_file):
         print(f"Ошибка: файл резервной копии не найден: {backup_file}")
         return False
@@ -129,9 +129,9 @@ def restore_database(backup_file):
         print(f"Ошибка при чтении файла резервной копии: {str(e)}")
         return False
     
-    # Создаем резервную копию текущей базы перед восстановлением
-    print("Создание резервной копии текущей базы данных перед восстановлением...")
-    backup_before_restore = backup_database("backups/before_restore")
+    # Создаем резервную копию текущей базы перед восстановлением (опционально, но рекомендуется)
+    # print("Создание резервной копии текущей базы данных перед восстановлением...")
+    # backup_before_restore = backup_database("backups/before_restore")
     
     # Запрашиваем подтверждение
     confirmation = input("Вы уверены, что хотите очистить текущую базу данных и восстановить данные из резервной копии? (y/n): ")
@@ -145,57 +145,136 @@ def restore_database(backup_file):
     
     # Восстанавливаем узлы
     print("Восстановление узлов...")
+    created_nodes_count = 0
     # Восстанавливаем курсы
     for course_data in backup_data["nodes"]["courses"]:
-        course = course_data["c"]
-        course_node = Node("Course", **course)
+        course_props = course_data["c"]
+        course_node = Node("Course", **course_props)
         graph.create(course_node)
-        print(f"Восстановлен курс: {course.get('name', 'Без имени')}")
+        created_nodes_count += 1
+        # print(f"Восстановлен курс: {course_props.get('name', 'Без имени')}")
     
     # Восстанавливаем главы
     for chapter_data in backup_data["nodes"]["chapters"]:
-        chapter = chapter_data["ch"]
-        chapter_node = Node("Chapter", **chapter)
+        chapter_props = chapter_data["ch"]
+        chapter_node = Node("Chapter", **chapter_props)
         graph.create(chapter_node)
-        print(f"Восстановлена глава: {chapter.get('title', 'Без названия')}")
+        created_nodes_count += 1
+        # print(f"Восстановлена глава: {chapter_props.get('title', 'Без названия')}") # Используем 'title' для глав, если есть
     
     # Восстанавливаем понятия
+    concepts_count = 0
     for concept_data in backup_data["nodes"]["concepts"]:
-        concept = concept_data["c"]
-        concept_node = Node("Concept", **concept)
+        concept_props = concept_data["c"]
+        concept_node = Node("Concept", **concept_props)
         graph.create(concept_node)
+        created_nodes_count += 1
+        concepts_count += 1
     
-    print(f"Восстановлено {len(backup_data['nodes']['concepts'])} понятий")
+    print(f"Восстановлено узлов (Курсы, Главы, Понятия): {created_nodes_count}")
+    print(f"Из них понятий: {concepts_count}")
     
-    # Восстанавливаем связи
-    print("Восстановление связей...")
+    # --- Создание маппинга: original_id -> new_node_object ---
+    print("Построение карты ID старых и новых узлов...")
+    original_id_to_new_node = {}
+    nodes_found_for_mapping = 0
+    mapping_errors = 0
+    
+    # Собираем все уникальные ID из связей
+    all_original_ids = set()
     for rel_data in backup_data["relationships"]["details"]:
-        # Находим исходный узел
-        source_query = """
-        MATCH (n)
-        WHERE n.name = $name AND $label IN labels(n)
-        RETURN n LIMIT 1
-        """
-        source_label = rel_data["source_labels"][0]
-        source_node = graph.evaluate(source_query, name=rel_data["source_name"], label=source_label)
+        all_original_ids.add(rel_data["source_id"])
+        all_original_ids.add(rel_data["target_id"])
+    
+    print(f"Найдено {len(all_original_ids)} уникальных ID узлов в связях бэкапа.")
+    
+    # Ищем новые узлы по имени/метке для каждого уникального ID
+    # Используем данные из details, так как там есть и ID, и имя, и метки
+    processed_ids_for_map = set()
+    for rel_data in backup_data["relationships"]["details"]:
+        # Обрабатываем source_id, если еще не обработан
+        source_id = rel_data["source_id"]
+        if source_id not in processed_ids_for_map:
+            source_name = rel_data["source_name"]
+            source_label = rel_data["source_labels"][0] if rel_data["source_labels"] else None
+            if source_name and source_label:
+                # Используем имя 'title' для глав, если метка Chapter
+                name_prop = 'title' if source_label == 'Chapter' else 'name'
+                query = f"MATCH (n:{source_label}) WHERE n.{name_prop} = $name RETURN n LIMIT 1"
+                try:
+                    # Используем graph.evaluate() который вернет один узел или None
+                    node = graph.evaluate(query, name=source_name)
+                    if node:
+                        original_id_to_new_node[source_id] = node
+                        nodes_found_for_mapping += 1
+                    else:
+                        print(f"Предупреждение: Не удалось найти новый узел для original_id {source_id} (Имя: '{source_name}', Метка: {source_label})")
+                        mapping_errors += 1
+                except Exception as e:
+                    print(f"Ошибка при поиске узла для карты {source_id} (Имя: '{source_name}', Метка: {source_label}): {e}")
+                    mapping_errors += 1
+            processed_ids_for_map.add(source_id)
         
-        # Находим целевой узел
-        target_query = """
-        MATCH (n)
-        WHERE n.name = $name AND $label IN labels(n)
-        RETURN n LIMIT 1
-        """
-        target_label = rel_data["target_labels"][0]
-        target_node = graph.evaluate(target_query, name=rel_data["target_name"], label=target_label)
+        # Обрабатываем target_id, если еще не обработан
+        target_id = rel_data["target_id"]
+        if target_id not in processed_ids_for_map:
+            target_name = rel_data["target_name"]
+            target_label = rel_data["target_labels"][0] if rel_data["target_labels"] else None
+            if target_name and target_label:
+                name_prop = 'title' if target_label == 'Chapter' else 'name'
+                query = f"MATCH (n:{target_label}) WHERE n.{name_prop} = $name RETURN n LIMIT 1"
+                try:
+                    node = graph.evaluate(query, name=target_name)
+                    if node:
+                        original_id_to_new_node[target_id] = node
+                        # Не увеличиваем nodes_found_for_mapping здесь, чтобы считать уникальные узлы
+                    else:
+                        print(f"Предупреждение: Не удалось найти новый узел для original_id {target_id} (Имя: '{target_name}', Метка: {target_label})")
+                        mapping_errors += 1
+                except Exception as e:
+                    print(f"Ошибка при поиске узла для карты {target_id} (Имя: '{target_name}', Метка: {target_label}): {e}")
+                    mapping_errors += 1
+            processed_ids_for_map.add(target_id)
+    
+    print(f"Завершено построение карты: Найдено {len(original_id_to_new_node)} узлов из {len(all_original_ids)}. Ошибок/ненайденных: {mapping_errors}")
+    if mapping_errors > 0:
+        print("ПРЕДУПРЕЖДЕНИЕ: Не все узлы из связей бэкапа были найдены в новой базе. Некоторые связи могут быть не восстановлены.")
+    
+    # Восстанавливаем связи, используя маппинг ID
+    print("Восстановление связей...")
+    rels_created_count = 0
+    rels_skipped_count = 0
+    for rel_data in backup_data["relationships"]["details"]:
+        source_id = rel_data["source_id"]
+        target_id = rel_data["target_id"]
         
-        # Создаем связь, если оба узла найдены
+        # Получаем новые узлы из карты
+        source_node = original_id_to_new_node.get(source_id)
+        target_node = original_id_to_new_node.get(target_id)
+        
+        # Создаем связь, если оба узла были найдены в карте
         if source_node and target_node:
             rel_type = rel_data["relationship_type"]
-            description = rel_data.get("description", "")
-            rel = Relationship(source_node, rel_type, target_node, description=description)
+            # Убедимся, что description существует, иначе пустая строка
+            properties = {"description": rel_data.get("description", "")}
+            # Добавим другие свойства связи, если они есть в бэкапе
+            # for key, value in rel_data.items():
+            #     if key not in ["source_id", "source_name", "source_labels",
+            #                     "target_id", "target_name", "target_labels",
+            #                     "relationship_type", "description"]:
+            #         properties[key] = value
+            
+            rel = Relationship(source_node, rel_type, target_node, **properties)
             graph.create(rel)
+            rels_created_count += 1
+        else:
+            rels_skipped_count += 1
+            # print(f"Пропуск связи: не найден один или оба узла в карте для {source_id} -> {target_id}")
     
-    print(f"Восстановлено {len(backup_data['relationships']['details'])} связей")
+    print(f"Восстановлено связей: {rels_created_count}")
+    if rels_skipped_count > 0:
+        print(f"Пропущено связей из-за отсутствия узлов в карте: {rels_skipped_count}")
+    
     print(f"Восстановление из резервной копии успешно завершено")
     return True
 

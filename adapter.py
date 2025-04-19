@@ -99,6 +99,10 @@ def analyze_chapter_with_grok(chapter):
         print(f"Слишком много понятий ({len(concepts_from_summary)}), вероятно дубликаты. Уникальных: {len(unique_concepts)}")
         concepts_from_summary = unique_concepts
     
+    # Проверяем количество понятий и размер главы
+    if len(concepts_from_summary) > 30 or len(chapter['content']) > 8000:
+        return analyze_large_chapter(chapter, concepts_from_summary)
+    
     # Выводим список первых 10 понятий для проверки
     if concepts_from_summary:
         print("Примеры найденных понятий:", concepts_from_summary[:10])
@@ -207,10 +211,10 @@ def analyze_chapter_with_grok(chapter):
                     json={
                         "model": AI_MODEL,
                         "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": 3000,
+                        "max_tokens": 8000,
                         "temperature": 0.7
                     },
-                    timeout=180  # Уменьшенный таймаут для надежности
+                    timeout=300
                 )
                 
                 if response.status_code == 200:
@@ -224,7 +228,45 @@ def analyze_chapter_with_grok(chapter):
                         if json_match:
                             content = json_match.group(1)
                         
-                        parsed_data = json.loads(content)
+                        # Попытка напрямую распарсить JSON
+                        try:
+                            parsed_data = json.loads(content)
+                        except json.JSONDecodeError as e:
+                            # Если не удалось распарсить целиком, попробуем найти самый большой валидный JSON
+                            print(f"Ошибка при парсинге JSON: {str(e)}. Пытаемся восстановить частичный ответ.")
+                            content_fixed = content
+                            
+                            # Пытаемся отрезать текст до начала фигурной скобки и после последней
+                            start_brace = content.find('{')
+                            end_brace = content.rfind('}')
+                            
+                            if start_brace != -1 and end_brace != -1 and end_brace > start_brace:
+                                content_fixed = content[start_brace:end_brace+1]
+                                
+                                # Пытаемся распарсить JSON после чистки
+                                try:
+                                    parsed_data = json.loads(content_fixed)
+                                    print("JSON восстановлен успешно после базовой чистки!")
+                                except json.JSONDecodeError:
+                                    # Если всё ещё не работает, пытаемся более агрессивную чистку с помощью regex
+                                    # Ищем паттерн, который может быть валидным JSON объектом
+                                    json_pattern = r'(\{[^{]*"main_ideas"\s*:\s*\[[^\[\]]*\][^}]*\})'
+                                    match = re.search(json_pattern, content_fixed)
+                                    if match:
+                                        try:
+                                            potential_json = match.group(1)
+                                            # Починка обрывающихся массивов и объектов
+                                            potential_json = re.sub(r',\s*]', ']', potential_json)
+                                            potential_json = re.sub(r',\s*}', '}', potential_json)
+                                            
+                                            parsed_data = json.loads(potential_json)
+                                            print("JSON восстановлен с помощью regex!")
+                                        except:
+                                            raise
+                                    else:
+                                        raise
+                            else:
+                                raise
                         
                         # Добавляем информацию о всех найденных понятиях
                         if all_found_concepts:
@@ -252,12 +294,49 @@ def analyze_chapter_with_grok(chapter):
                         print(f"Ошибка при разборе JSON для главы {chapter['title']}")
                         print(f"Ответ API: {content[:200]}...")  # Печатаем только начало для отладки
                         
+                        # Попытаемся восстановить неполный JSON
+                        try:
+                            # Ищем начало JSON-объекта
+                            if content.startswith('{'):
+                                # Попробуем найти максимально корректную часть JSON
+                                content_fixed = '{'
+                                bracket_count = 1
+                                for char in content[1:]:
+                                    if char == '{':
+                                        bracket_count += 1
+                                    elif char == '}':
+                                        bracket_count -= 1
+                                    content_fixed += char
+                                    if bracket_count == 0:
+                                        break
+                                
+                                if bracket_count == 0:
+                                    print("Попытка восстановить частичный JSON...")
+                                    parsed_data = json.loads(content_fixed)
+                                    print("JSON восстановлен успешно!")
+                                    return parsed_data
+                        except:
+                            print("Не удалось восстановить частичный JSON")
+                        
                         if current_attempt < max_attempts:
                             print(f"Повторная попытка через 5 секунд...")
                             time.sleep(5)
                             continue
                         else:
-                            return None
+                            # Вместо None возвращаем базовый шаблон с информацией о главе
+                            print(f"Возвращаем базовый шаблон для главы {chapter['title']}")
+                            return {
+                                "main_ideas": [f"Не удалось проанализировать главу {chapter['title']} из-за ошибки API"],
+                                "concepts": [
+                                    {
+                                        "name": concept_name,
+                                        "definition": "Определение не получено из-за ошибки API",
+                                        "example": "Пример не получен из-за ошибки API", 
+                                        "questions": ["Вопросы не сформулированы из-за ошибки API"]
+                                    } for concept_name in concepts_from_summary[:5]  # Используем первые 5 понятий из саммари
+                                ] if concepts_from_summary else [],
+                                "relationships": []
+                            }
                 else:
                     print(f"Ошибка API: {response.status_code}")
                     if hasattr(response, 'text'):
@@ -268,7 +347,20 @@ def analyze_chapter_with_grok(chapter):
                         time.sleep(5)
                         continue
                     else:
-                        return None
+                        # Вместо None возвращаем базовый шаблон с информацией о главе
+                        print(f"Возвращаем базовый шаблон для главы {chapter['title']}")
+                        return {
+                            "main_ideas": [f"Не удалось проанализировать главу {chapter['title']} из-за сетевой ошибки"],
+                            "concepts": [
+                                {
+                                    "name": concept_name,
+                                    "definition": "Определение не получено из-за сетевой ошибки",
+                                    "example": "Пример не получен из-за сетевой ошибки", 
+                                    "questions": ["Вопросы не сформулированы из-за сетевой ошибки"]
+                                } for concept_name in concepts_from_summary[:5]  # Используем первые 5 понятий из саммари
+                            ] if concepts_from_summary else [],
+                            "relationships": []
+                        }
                 
             except requests.exceptions.RequestException as e:
                 print(f"Сетевая ошибка при обращении к API: {str(e)}")
@@ -278,13 +370,51 @@ def analyze_chapter_with_grok(chapter):
                     time.sleep(5)
                     continue
                 else:
-                    return None
+                    # Вместо None возвращаем базовый шаблон с информацией о главе
+                    print(f"Возвращаем базовый шаблон для главы {chapter['title']}")
+                    return {
+                        "main_ideas": [f"Не удалось проанализировать главу {chapter['title']} из-за сетевой ошибки"],
+                        "concepts": [
+                            {
+                                "name": concept_name,
+                                "definition": "Определение не получено из-за сетевой ошибки",
+                                "example": "Пример не получен из-за сетевой ошибки", 
+                                "questions": ["Вопросы не сформулированы из-за сетевой ошибки"]
+                            } for concept_name in concepts_from_summary[:5]  # Используем первые 5 понятий из саммари
+                        ] if concepts_from_summary else [],
+                        "relationships": []
+                    }
                 
-        return None  # Если все попытки не удались
+        # Если все попытки не удались, возвращаем базовый шаблон вместо None
+        print(f"Все попытки анализа главы {chapter['title']} не удались. Возвращаем базовый шаблон")
+        return {
+            "main_ideas": [f"Не удалось проанализировать главу {chapter['title']} после {max_attempts} попыток"],
+            "concepts": [
+                {
+                    "name": concept_name,
+                    "definition": "Определение не получено после нескольких попыток",
+                    "example": "Пример не получен после нескольких попыток", 
+                    "questions": ["Вопросы не сформулированы после нескольких попыток"]
+                } for concept_name in concepts_from_summary[:5]  # Используем первые 5 понятий из саммари
+            ] if concepts_from_summary else [],
+            "relationships": []
+        }
             
     except Exception as e:
         print(f"Ошибка при обработке главы {chapter['title']}: {str(e)}")
-        return None
+        # Вместо None возвращаем базовый шаблон с информацией о главе
+        return {
+            "main_ideas": [f"Произошла ошибка при анализе главы {chapter['title']}: {str(e)}"],
+            "concepts": [
+                {
+                    "name": concept_name,
+                    "definition": "Определение не получено из-за внутренней ошибки",
+                    "example": "Пример не получен из-за внутренней ошибки", 
+                    "questions": ["Вопросы не сформулированы из-за внутренней ошибки"]
+                } for concept_name in concepts_from_summary[:5]  # Используем первые 5 понятий из саммари
+            ] if concepts_from_summary else [],
+            "relationships": []
+        }
 
 def generate_additional_relationships(parsed_data):
     """Генерирует дополнительные связи между понятиями, если модель вернула мало связей"""
@@ -355,7 +485,13 @@ def load_to_neo4j(chapters_data, course_name="Системное самораз�
             chapter_data = chapter_info.get("analysis", {})
             
             if not chapter_data:
+                print(f"Пропускаем главу '{chapter_title}' - нет данных анализа")
                 continue  # Пропускаем главы без анализа
+            
+            # Проверка на наличие обязательных полей
+            if not isinstance(chapter_data.get("main_ideas"), list) or not isinstance(chapter_data.get("concepts"), list):
+                print(f"Пропускаем главу '{chapter_title}' - некорректный формат данных анализа")
+                continue
             
             # Создаем узел главы
             chapter_node = Node("Chapter", 
@@ -372,26 +508,79 @@ def load_to_neo4j(chapters_data, course_name="Системное самораз�
             
             # Создаем узлы понятий и связываем их с главой
             for concept in chapter_data.get("concepts", []):
+                # Проверка валидности данных понятия
+                if not isinstance(concept, dict) or "name" not in concept:
+                    print(f"Пропускаем невалидное понятие в главе '{chapter_title}'")
+                    continue
+                
                 concept_name = concept["name"]
                 
                 # Проверяем, есть ли уже такое понятие
                 concept_node = graph.nodes.match("Concept", name=concept_name).first()
                 
                 if not concept_node:
-                    # Создаем новый узел понятия
+                    # Создаем новый узел понятия с непустыми полями и указанием главы
+                    formatted_definition = f"[Из главы '{chapter_title}']: {concept.get('definition', 'Определение не найдено в тексте')}"
+                    formatted_example = f"[Из главы '{chapter_title}']: {concept.get('example', 'Пример не найден в тексте')}"
+                    
                     concept_node = Node("Concept",
                                       name=concept_name,
-                                      definition=concept.get("definition", ""),
-                                      example=concept.get("example", ""),
-                                      questions=concept.get("questions", []))
+                                      definition=formatted_definition,
+                                      example=formatted_example,
+                                      questions=concept.get("questions", ["Вопрос на понимание понятия не сформулирован"]))
+                    # Инициализируем chapters_mentions как JSON строку с пустым объектом
+                    concept_node["chapters_mentions"] = json.dumps({})
                     graph.create(concept_node)
                     concept_count += 1
-                elif concept.get("definition") and not concept_node.get("definition"):
-                    # Обновляем существующий узел, если в нем нет определения
-                    concept_node["definition"] = concept.get("definition")
-                    concept_node["example"] = concept.get("example", "")
-                    concept_node["questions"] = concept.get("questions", [])
-                    graph.push(concept_node)
+                else:
+                    # Обновляем определение существующего узла если это новое определение из новой главы
+                    # и только если текущее определение не содержит информацию из этой главы
+                    current_def = concept_node.get("definition", "")
+                    if concept.get("definition") and f"Из главы '{chapter_title}'" not in current_def:
+                        formatted_definition = f"[Из главы '{chapter_title}']: {concept.get('definition')}"
+                        if current_def and current_def != "Определение не найдено в тексте":
+                            # Если уже есть определение, добавляем новое через разделитель
+                            concept_node["definition"] = f"{current_def}\n\n{formatted_definition}"
+                        else:
+                            # Если определения нет или оно пустое, просто заменяем
+                            concept_node["definition"] = formatted_definition
+                        
+                        # Аналогично для примера
+                        current_example = concept_node.get("example", "")
+                        if concept.get("example") and f"Из главы '{chapter_title}'" not in current_example:
+                            formatted_example = f"[Из главы '{chapter_title}']: {concept.get('example')}"
+                            if current_example and current_example != "Пример не найден в тексте":
+                                concept_node["example"] = f"{current_example}\n\n{formatted_example}"
+                            else:
+                                concept_node["example"] = formatted_example
+                        
+                        graph.push(concept_node)
+                
+                # Сохраняем определения по главам
+                if concept.get("definition"):
+                    # Получаем текущие упоминания по главам
+                    try:
+                        # Если chapters_mentions - строка, пробуем её распарсить
+                        chapters_mentions_str = concept_node.get("chapters_mentions", "{}")
+                        if isinstance(chapters_mentions_str, str):
+                            chapters_mentions = json.loads(chapters_mentions_str)
+                        else:
+                            # Если это не строка, создаем новый словарь
+                            chapters_mentions = {}
+                        
+                        # Сохраняем определение для этой главы
+                        chapter_key = f"chapter_{i+1}"
+                        chapters_mentions[chapter_key] = {
+                            "chapter_title": chapter_title,
+                            "definition": concept.get("definition", ""),
+                            "example": concept.get("example", "")
+                        }
+                        
+                        # Преобразуем словарь в JSON-строку перед сохранением в Neo4j
+                        concept_node["chapters_mentions"] = json.dumps(chapters_mentions, ensure_ascii=False)
+                        graph.push(concept_node)
+                    except Exception as e:
+                        print(f"Ошибка при обновлении chapters_mentions для понятия '{concept_name}': {str(e)}")
                 
                 # Сохраняем узел в кэше для использования при создании связей
                 nodes_cache[concept_name] = concept_node
@@ -462,6 +651,279 @@ def load_to_neo4j(chapters_data, course_name="Системное самораз�
         print(f"Ошибка при загрузке данных в Neo4j: {str(e)}")
         return False
 
+# Функция для анализа больших глав с разбиением на части
+def analyze_large_chapter(chapter, all_concepts):
+    """Анализирует большую главу, разбивая ее на части или обрабатывая понятия группами"""
+    print(f"Глава слишком большая или содержит слишком много понятий. Разбиваем на части.")
+    
+    # Если найдено очень много понятий, разделим их на группы по 10 (уменьшено с 20)
+    if len(all_concepts) > 10:
+        concept_groups = [all_concepts[i:i+10] for i in range(0, len(all_concepts), 10)]
+        print(f"Разделили {len(all_concepts)} понятий на {len(concept_groups)} групп")
+        
+        # Создаем базовый шаблон результата
+        result = {
+            "main_ideas": [],
+            "concepts": [],
+            "relationships": []
+        }
+        
+        # Отслеживаем, какие понятия уже обработаны
+        processed_concepts = set()
+        
+        for i, concept_group in enumerate(concept_groups):
+            print(f"Анализ группы понятий {i+1}/{len(concept_groups)}: {', '.join(concept_group)}")
+            
+            # Формируем промпт только для этой группы понятий
+            prompt = f"""
+Проанализируй следующую главу из курса по системному мышлению:
+
+Название: {chapter['title']}
+
+Содержание (первые 5000 символов):
+{chapter['content'][:5000]}
+
+В этой главе определены следующие основные понятия: {', '.join(concept_group)}.
+
+ОЧЕНЬ ВАЖНО: Необходимо проанализировать ВСЕ перечисленные понятия без исключения! Для каждого из них нужно:
+1. Найти или сформулировать определение на основе текста главы
+2. Найти или создать пример использования опираясь на текст
+3. Сформулировать 2-3 вопроса для проверки понимания
+
+Если для какого-то понятия невозможно найти определение или пример в тексте, придумай их на основе общего контекста главы.
+
+Также выполни следующие задачи:
+1. Выдели 1-2 главные мысли главы относительно этих понятий
+2. Найди связи между понятиями по следующим типам:
+   - RELATES_TO (связано с) - общая связь между понятиями
+   - PART_OF (является частью) - отношение часть-целое
+   - IS_A (является) - отношение "является"/"тип"
+   - PREREQUISITE_FOR (необходимо для) - понятие A необходимо понять перед понятием B
+   - EXAMPLE_OF (пример) - понятие A является примером понятия B
+   - CONTRASTS_WITH (противоположно) - противоположные понятия
+   - EVOLVED_FROM (развилось из) - историческое развитие
+   - USED_IN (используется в) - применение понятия в контексте
+
+Результат представь в формате JSON со следующей структурой:
+{{
+  "main_ideas": ["идея 1", "идея 2"],
+  "concepts": [
+    {{
+      "name": "Название понятия",
+      "definition": "Определение понятия из текста",
+      "example": "Пример использования из текста",
+      "questions": ["Вопрос 1", "Вопрос 2", "Вопрос 3"]
+    }},
+    // НЕОБХОДИМО включить все {len(concept_group)} понятий в этот список!
+  ],
+  "relationships": [
+    {{
+      "source": "Понятие-источник",
+      "target": "Понятие-цель",
+      "type": "ТИП_СВЯЗИ",
+      "description": "Описание связи"
+    }}
+  ]
+}}
+
+УБЕДИСЬ, что в ответе есть все {len(concept_group)} понятий из списка! Отвечай только в формате JSON, без дополнительного текста.
+"""
+            
+            # Делаем запрос к API и обрабатываем результат
+            try:
+                # Стандартная часть кода для запроса API (аналогично существующему коду)
+                response = requests.post(
+                    url="https://openrouter.ai/api/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                        "Content-Type": "application/json",
+                        "HTTP-Referer": "https://adapter-course.ru",
+                        "X-Title": "Adapter Course",
+                    },
+                    json={
+                        "model": AI_MODEL,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 8000,
+                        "temperature": 0.7
+                    },
+                    timeout=300
+                )
+                
+                if response.status_code == 200:
+                    content = response.json()['choices'][0]['message']['content']
+                    
+                    # Обработка ответа по аналогии с существующим кодом
+                    try:
+                        json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
+                        if json_match:
+                            content = json_match.group(1)
+                        
+                        # Обработка JSON с учетом ошибок
+                        try:
+                            part_data = json.loads(content)
+                            
+                            # Проверяем структуру данных
+                            if not isinstance(part_data, dict):
+                                print(f"Некорректный формат JSON для группы {i+1} - получен не словарь")
+                                continue
+                            
+                            # Проверяем наличие обязательных полей
+                            if not isinstance(part_data.get("main_ideas"), list):
+                                print(f"Отсутствуют или некорректны main_ideas в ответе для группы {i+1}")
+                                part_data["main_ideas"] = [f"Идея для группы понятий {i+1}"]
+                            
+                            if not isinstance(part_data.get("concepts"), list):
+                                print(f"Отсутствуют или некорректны concepts в ответе для группы {i+1}")
+                                part_data["concepts"] = []
+                            
+                            if not isinstance(part_data.get("relationships"), list):
+                                print(f"Отсутствуют или некорректны relationships в ответе для группы {i+1}")
+                                part_data["relationships"] = []
+                            
+                            # Проверяем, все ли понятия из группы присутствуют в ответе
+                            received_concepts = {c["name"] for c in part_data.get("concepts", []) if isinstance(c, dict) and "name" in c}
+                            missing_concepts = set(concept_group) - received_concepts
+                            
+                            if missing_concepts:
+                                print(f"ВНИМАНИЕ: {len(missing_concepts)} понятий не обработаны в группе {i+1}: {', '.join(missing_concepts)}")
+                                
+                                # Создаем базовые определения для отсутствующих понятий
+                                for missing in missing_concepts:
+                                    part_data.setdefault("concepts", []).append({
+                                        "name": missing,
+                                        "definition": f"Определение понятия не получено от API. Требуется анализ.",
+                                        "example": "Пример не получен от API",
+                                        "questions": ["Вопрос на понимание не сформулирован"]
+                                    })
+                                    print(f"Добавлено базовое определение для понятия '{missing}'")
+                            
+                            # Отмечаем, какие понятия были обработаны
+                            for concept in part_data.get("concepts", []):
+                                if isinstance(concept, dict) and "name" in concept:
+                                    processed_concepts.add(concept["name"])
+                            
+                            # Объединяем результаты
+                            result["main_ideas"].extend(part_data.get("main_ideas", []))
+                            result["concepts"].extend(part_data.get("concepts", []))
+                            result["relationships"].extend(part_data.get("relationships", []))
+                            
+                            print(f"Успешно обработано {len(part_data.get('concepts', []))} понятий в группе {i+1}")
+                        except json.JSONDecodeError as e:
+                            print(f"Ошибка при разборе JSON группы {i+1}: {str(e)}")
+                            # Пытаемся восстановить JSON
+                            try:
+                                # Ищем начало и конец фигурных скобок
+                                start_brace = content.find('{')
+                                end_brace = content.rfind('}')
+                                
+                                if start_brace != -1 and end_brace != -1 and end_brace > start_brace:
+                                    # Вырезаем потенциальный JSON
+                                    content_fixed = content[start_brace:end_brace+1]
+                                    
+                                    # Чистим некорректные запятые в конце массивов и объектов
+                                    content_fixed = re.sub(r',\s*]', ']', content_fixed)
+                                    content_fixed = re.sub(r',\s*}', '}', content_fixed)
+                                    
+                                    # Восстанавливаем кавычки (часто возникает при ошибках парсинга)
+                                    content_fixed = re.sub(r'([{,]\s*)(\w+)(\s*:)', r'\1"\2"\3', content_fixed)
+                                    
+                                    # Пробуем распарсить восстановленный JSON
+                                    part_data = json.loads(content_fixed)
+                                    
+                                    # Проверяем структуру и объединяем
+                                    if isinstance(part_data, dict):
+                                        # Проверяем и инициализируем необходимые поля
+                                        if not isinstance(part_data.get("main_ideas"), list):
+                                            part_data["main_ideas"] = [f"Восстановленная идея для группы {i+1}"]
+                                            
+                                        if not isinstance(part_data.get("concepts"), list):
+                                            part_data["concepts"] = []
+                                            
+                                        if not isinstance(part_data.get("relationships"), list):
+                                            part_data["relationships"] = []
+                                        
+                                        # Проверяем и добавляем отсутствующие понятия
+                                        received_concepts = {c["name"] for c in part_data.get("concepts", []) if isinstance(c, dict) and "name" in c}
+                                        missing_concepts = set(concept_group) - received_concepts
+                                        
+                                        if missing_concepts:
+                                            print(f"ВНИМАНИЕ: {len(missing_concepts)} понятий не обработаны в группе {i+1} после восстановления JSON")
+                                            
+                                            # Создаем базовые определения для отсутствующих понятий
+                                            for missing in missing_concepts:
+                                                part_data.setdefault("concepts", []).append({
+                                                    "name": missing,
+                                                    "definition": f"Определение понятия не получено из восстановленного JSON",
+                                                    "example": "Пример не получен",
+                                                    "questions": ["Вопрос на понимание не сформулирован"]
+                                                })
+                                                print(f"Добавлено базовое определение для понятия '{missing}'")
+                                        
+                                        # Отмечаем, какие понятия были обработаны
+                                        for concept in part_data.get("concepts", []):
+                                            if isinstance(concept, dict) and "name" in concept:
+                                                processed_concepts.add(concept["name"])
+                                        
+                                        # Объединяем результаты
+                                        result["main_ideas"].extend(part_data.get("main_ideas", []))
+                                        result["concepts"].extend(part_data.get("concepts", []))
+                                        result["relationships"].extend(part_data.get("relationships", []))
+                                        
+                                        print(f"Успешно восстановлен и обработан JSON для группы {i+1}")
+                                else:
+                                    print(f"Не удалось найти корректные границы JSON для группы {i+1}")
+                            except Exception as nested_e:
+                                print(f"Не удалось восстановить JSON для группы {i+1}: {str(nested_e)}")
+                            # В любом случае продолжаем обработку следующих групп
+                    except Exception as e:
+                        print(f"Ошибка при обработке ответа API для группы {i+1}: {str(e)}")
+                else:
+                    print(f"Ошибка API для группы {i+1}: {response.status_code}")
+            except Exception as e:
+                print(f"Ошибка запроса для группы {i+1}: {str(e)}")
+            
+            # Небольшая пауза между запросами
+            time.sleep(5)
+        
+        # После обработки всех групп проверяем, какие понятия все еще не обработаны
+        all_missing = set(all_concepts) - processed_concepts
+        if all_missing:
+            print(f"ВНИМАНИЕ: {len(all_missing)} понятий не были обработаны ни в одной группе: {', '.join(all_missing)}")
+            
+            # Добавляем отсутствующие понятия с минимальной информацией
+            for missing in all_missing:
+                result["concepts"].append({
+                    "name": missing,
+                    "definition": "Определение понятия не получено в результате анализа",
+                    "example": "Пример не получен в результате анализа",
+                    "questions": ["Вопрос на понимание понятия не сформулирован"]
+                })
+                print(f"Добавлено минимальное определение для понятия '{missing}'")
+        
+        # Дедупликация и финальные корректировки
+        # Удаляем дубликаты идей
+        if result["main_ideas"]:
+            result["main_ideas"] = list(set(result["main_ideas"]))[:3]  # Не более 3 главных идей
+        
+        # Удаляем дубликаты понятий (по имени)
+        unique_concepts = {}
+        for concept in result["concepts"]:
+            if concept["name"] not in unique_concepts:
+                unique_concepts[concept["name"]] = concept
+        result["concepts"] = list(unique_concepts.values())
+        
+        print(f"Итоговый результат содержит {len(result['concepts'])} понятий из {len(all_concepts)} исходных")
+        
+        # Связи оставляем как есть, они могут повторяться для разных групп
+        
+        return result
+    else:
+        # Если понятий не слишком много, но глава большая, просто уменьшаем размер текста
+        print("Глава слишком большая, анализируем только первую часть")
+        chapter_copy = chapter.copy()
+        chapter_copy['content'] = chapter['content'][:7000]  # Берем только первые 7000 символов
+        return analyze_chapter_with_grok(chapter_copy)  # Рекурсивный вызов с уменьшенным содержимым
+
 def main():
     parser = argparse.ArgumentParser(description="Анализ курса с помощью Grok AI и запись в Neo4j")
     parser.add_argument("--course", type=str, default="Системное саморазвитие", help="Название курса")
@@ -508,7 +970,39 @@ def main():
             chapters_data = []
             for i, chapter in enumerate(chapters):
                 print(f"\nАнализ главы {i+1}/{len(chapters)}: {chapter['title']}")
-                chapter_analysis = analyze_chapter_with_grok(chapter)
+                
+                # Добавляем тайм-аут для всего процесса анализа главы
+                max_chapter_time = 600  # макс. 10 минут на главу (увеличено с 5 минут)
+                start_time = time.time()
+                
+                try:
+                    chapter_analysis = analyze_chapter_with_grok(chapter)
+                    
+                    # Проверка тайм-аута
+                    if time.time() - start_time > max_chapter_time:
+                        print(f"Превышено время анализа главы {chapter['title']} ({max_chapter_time} сек). Принудительно завершаем анализ.")
+                        # Создаем пустой анализ с сообщением об ошибке
+                        chapter_analysis = {
+                            "main_ideas": [f"Превышено время анализа главы {chapter['title']}"],
+                            "concepts": [],
+                            "relationships": []
+                        }
+                except Exception as e:
+                    print(f"КРИТИЧЕСКАЯ ОШИБКА при анализе главы {chapter['title']}: {str(e)}")
+                    chapter_analysis = {
+                        "main_ideas": [f"Критическая ошибка при анализе главы {chapter['title']}: {str(e)}"],
+                        "concepts": [],
+                        "relationships": []
+                    }
+                
+                # Если chapter_analysis всё равно None, создаем пустой анализ
+                if chapter_analysis is None:
+                    print(f"Ошибка: analyze_chapter_with_grok вернул None для главы {chapter['title']}")
+                    chapter_analysis = {
+                        "main_ideas": [f"Ошибка анализа главы {chapter['title']}"],
+                        "concepts": [],
+                        "relationships": []
+                    }
                 
                 # Генерация дополнительных связей между понятиями
                 chapter_analysis = generate_additional_relationships(chapter_analysis)
@@ -544,7 +1038,12 @@ def main():
                 concept_node = graph.nodes.match("Concept", name=concept_name).first()
                 if not concept_node:
                     print(f"Создание узла для понятия '{concept_name}'...")
-                    concept_node = Node("Concept", name=concept_name)
+                    concept_node = Node("Concept", 
+                                      name=concept_name,
+                                      definition=f"[Из глоссария курса '{course_name}']: Определение не найдено в тексте", 
+                                      example=f"[Из глоссария курса '{course_name}']: Пример не найден в тексте", 
+                                      questions=["Вопрос на понимание понятия не сформулирован"],
+                                      chapters_mentions={})
                     graph.create(concept_node)
                     
                     # Связываем понятие с курсом

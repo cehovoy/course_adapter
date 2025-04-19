@@ -78,8 +78,8 @@ def reset_course_structure(course_name, delete_concepts=False, graph=None):
         
         # Удаляем понятия
         query_concepts = """
-        MATCH (c:Concept)-[r:PART_OF]->(course:Course {name: $course_name})
-        DELETE r, c
+        MATCH (c:Concept)-[:PART_OF]->(course:Course {name: $course_name})
+        DETACH DELETE c
         """
         result = graph.run(query_concepts, course_name=course_name)
         print(f"Удалены понятия ({result.stats().get('nodes_deleted', 0)} понятий)")
